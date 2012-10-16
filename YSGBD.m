@@ -1,8 +1,7 @@
 //
 //  YSGBD.m
-//  EcoFeed
 //
-//  Created by Gérald HUARD on 08/02/12.
+//  Modified by Gildas A. on 16/10/12.
 //  Copyright (c) 2012 __MyCompanyName__. All rights reserved.
 //
 
@@ -12,34 +11,49 @@
 static YSGBD *sharedCurrent=NULL;
 
 @implementation YSGBD
-@synthesize sgbd;
 
+@synthesize sgbd;
 
 #pragma marl static functions
 +(YSGBD*) shared{
+    if (sharedCurrent == NULL) {
+        sharedCurrent = [[YSGBD alloc] initWithDBFileName:@"your_sgdb_name_here"];
+    }
     return sharedCurrent;
 }
+
 +(void) sClose{
     [[YSGBD shared] close];
 }
+
++(void) sOpen{
+    [[YSGBD shared] open];
+}
+
 +(BOOL) sExec:(NSString*)req{
     return [[YSGBD shared] exec:req];
 }
-+(NSArray*) sExecAndGet:(NSString*)req{
+
++(NSMutableArray*) sExecAndGet:(NSString*)req{
     return [[YSGBD shared] execAndGet:req];
 }
+
 +(BOOL) sInsertDict:(NSDictionary*)dict intoTable:(NSString*)table{
     return [[YSGBD shared] insertDict:dict intoTable:table];
 }
+
 +(BOOL) sUpdateDict:(NSDictionary*)dict intoTable:(NSString*)table withKeysNames:(NSArray*)keys{
     return [[YSGBD shared] updateDict:dict intoTable:table withKeysNames:keys];
 }
+
 +(BOOL) sPutWithDict:(NSDictionary*)dict intoTable:(NSString*)table andKeysNames:(NSArray*)keys{
     return [[YSGBD shared] putWithDict:dict intoTable:table andKeysNames:keys];
 }
+
 +(BOOL) sRemoveWithDict:(NSDictionary*)dict intoTable:(NSString*)table andKeysNames:(NSArray*)keys{
     return [[YSGBD shared] removeWithDict:dict fromTable:table andKeysNames:keys];
 }
+
 +(BOOL) sEmptyTable:(NSString *)tableName{
     return [[YSGBD shared] emptyTable:tableName];
 }
@@ -47,40 +61,53 @@ static YSGBD *sharedCurrent=NULL;
 
 #pragma mark instance functions
 -(id) initWithDBFileName:(NSString*)_dbfilename{
-
-    self=[super init];
-    
-    if (self){
+    if (self=[super init]){
         dbfilename=_dbfilename;
         sgbd_opened=NO;
         sharedCurrent=self;
     }
-
+    
     return self;
 }
-        
+
 -(void) open{
     
     if (sgbd_opened && [sgbd_openedpath isEqualToString:dbpathname])return;
     else{
         [self setEditableDatabaseIfNeeded];
-
+        
         const char *path = [dbpathname UTF8String];
         
         
         
         if (sqlite3_open_v2(path, &sgbd, SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, "unix-none") == SQLITE_OK){
             sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
-        //if (sqlite3_open(path, &sgbd) == SQLITE_OK){
+            //if (sqlite3_open(path, &sgbd) == SQLITE_OK){
             sgbd_opened=YES;
             sgbd_openedpath=dbpathname;
-            NSLog(@"SGBD [%@] opened...",dbpathname);
+    		
+            //Making every stuff with the database transactional.
+            [self beginTransaction];
+            NSLog(@"[SGBD][Error] [%@] opened...",dbpathname);
         }
         else{
-            NSLog(@"SGBD [%@] opening error...",dbpathname);
+            
+            NSLog(@"[SGBD][Error] [%@] opening error...",dbpathname);
             [self logerr];
         }
     }
+}
+
+- (void) beginTransaction{
+    sqlite3_exec(sgbd, "BEGIN", 0, 0, 0);
+}
+
+- (void) rollBackTransaction{
+    sqlite3_exec(sgbd, "ROLLBACK", 0, 0, 0);
+}
+
+- (void) commitTransaction{
+    sqlite3_exec(sgbd, "COMMIT", 0, 0, 0);
 }
 
 - (void)setEditableDatabaseIfNeeded {
@@ -95,23 +122,26 @@ static YSGBD *sharedCurrent=NULL;
     dbpathname=writableDBPath;
     
     if (success){
-        NSLog(@"NO Copy SGBD [%@]",writableDBPath);
+        NSLog(@"[SGBD][Infos] dbpath -> %@",writableDBPath);
         return;
     }   
     NSString *defaultDBPath = [[[NSBundle mainBundle] resourcePath] stringByAppendingPathComponent:dbfilename];
     success = [fileManager copyItemAtPath:defaultDBPath toPath:writableDBPath error:&error];
-    NSLog(@"Copy SGBD [%@] to [%@]",defaultDBPath,writableDBPath);
+    NSLog(@"[SGBD][Infos] Copy SGBD [%@] to [%@]",defaultDBPath,writableDBPath);
     if (!success) {
-        NSLog(@"Failed to create writable database file [%@] from [%@] with message '%@'.",writableDBPath,defaultDBPath, [error localizedDescription]);
+        NSLog(@"[SGBD][Error] Failed to create writable database file [%@] from [%@] with message '%@'.",writableDBPath,defaultDBPath, [error localizedDescription]);
     }
 }
 
 -(void) close{
-    if (sgbd_opened)sqlite3_close(sgbd);
+    if (sgbd_opened){
+        [self commitTransaction];
+        sqlite3_close(sgbd);
+        //NSLog(@"[SGBD][Infos] [%@] closed...",dbpathname);
+    }
     sgbd_opened=NO;
     sgbd_openedpath=@"";
 }
-
 
 -(BOOL) insertDict:(NSDictionary*)dict intoTable:(NSString*)table{
     if (!sgbd_opened)return NO;
@@ -122,7 +152,37 @@ static YSGBD *sharedCurrent=NULL;
     NSString *key;
     
     while ((key = [enumerator nextObject]))[req appendFormat:@"\"%@\",",key];
+    
+    req = [NSMutableString stringWithString:[req substringToIndex:[req length] - 1]];
+    [req appendFormat:@") VALUES ("];
+    
+    enumerator = [dict keyEnumerator];
+    
+    while ((key = [enumerator nextObject])){
+        NSObject *value = [dict objectForKey:key];
+        
+        //Permet d'echapper les simples quote lors de l'insertion.
+        if ([value isKindOfClass:[NSString class]]) {
+            value = [(NSString*)value stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+        }
+        [req appendFormat:@"'%@',",value];
+    }
+    req = [NSMutableString stringWithString:[req substringToIndex:[req length] - 1]];
+    [req appendFormat:@");"];
+    
+    return [self exec:req];
+}
 
+-(BOOL) replaceDict:(NSDictionary*)dict intoTable:(NSString*)table{
+    if (!sgbd_opened)return NO;
+    
+    
+    NSMutableString *req=[NSMutableString stringWithFormat:@"REPLACE INTO %@(",table];
+    NSEnumerator *enumerator = [dict keyEnumerator];
+    NSString *key;
+    
+    while ((key = [enumerator nextObject]))[req appendFormat:@"\"%@\",",key];
+    
     req = [NSMutableString stringWithString:[req substringToIndex:[req length] - 1]];
     [req appendFormat:@") VALUES ("];
     
@@ -134,36 +194,52 @@ static YSGBD *sharedCurrent=NULL;
     return [self exec:req];
 }
 
-
 -(BOOL) rowExistWithDict:(NSDictionary*)dict table:(NSString*)table andKeysNames:(NSArray*)keys{
     NSString *req=[NSString stringWithFormat:@"SELECT %@ FROM %@ WHERE 1=1 ",[keys componentsJoinedByString:@","],table];
     
     NSMutableString *where=[NSMutableString stringWithFormat:@""];
     for (int i=0;i<[keys count];i++){
         NSString *key=[keys objectAtIndex:i];
-        [where appendFormat:@"AND %@=\"%@\" ",key,[dict objectForKey:key]]; 
+        NSObject *value = [dict objectForKey:key];
+        
+        //Permet d'echapper les simples quote lors de l'insertion.
+        if ([value isKindOfClass:[NSString class]]) {
+            value = [(NSString*)value stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+        }
+        [where appendFormat:@"AND %@='%@' ",key,value]; 
     }
-    NSString *reqWithWhere=[req stringByAppendingFormat:where];
+    NSString *reqWithWhere=[req stringByAppendingString:where];
     
     NSArray *reps=[self execAndGet:reqWithWhere];
     return ([reps count]>0);
 }
 
-
 -(BOOL) updateDict:(NSDictionary*)dict intoTable:(NSString*)table withKeysNames:(NSArray*)keys{
     NSMutableString *req=[NSMutableString stringWithFormat:@"UPDATE %@ SET ",table];
- 
+    
     NSEnumerator *enumerator = [dict keyEnumerator];
     NSString *key;
     while ((key = [enumerator nextObject])){
-        [req appendFormat:@"%@=\"%@\", ",key,[dict objectForKey:key]];
+        NSObject *value = [dict objectForKey:key];
+        
+        //Permet d'echapper les simples quote lors de l'insertion.
+        if ([value isKindOfClass:[NSString class]]) {
+            value = [(NSString*)value stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+        }
+        [req appendFormat:@"%@='%@', ",key,value];
     }
     NSString *ssreq=[req substringToIndex:[req length]-2];
     req=[NSMutableString stringWithFormat:@"%@ WHERE 1=1 ",ssreq];
     
     for (int i=0;i<[keys count];i++){
         key=[keys objectAtIndex:i];
-        [req appendFormat:@"AND %@=\"%@\" ",key,[dict objectForKey:key]]; 
+        NSObject *value2 = [dict objectForKey:key];
+        
+        //Permet d'echapper les simples quote lors de l'insertion.
+        if ([value2 isKindOfClass:[NSString class]]) {
+            value2 = [(NSString*)value2 stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+        }
+        [req appendFormat:@"AND %@='%@' ",key,value2]; 
     }
     return ([self exec:req]);
 }
@@ -175,7 +251,6 @@ static YSGBD *sharedCurrent=NULL;
         return [self insertDict:dict intoTable:table];
 }
 
-
 -(BOOL) removeWithDict:(NSDictionary*)dict fromTable:(NSString*)table andKeysNames:(NSArray*)keys{
     if ([self rowExistWithDict:dict table:table andKeysNames:keys]){
         NSString *ssreq=[NSString stringWithFormat:@"DELETE FROM %@ ",table];
@@ -183,27 +258,31 @@ static YSGBD *sharedCurrent=NULL;
         
         for (int i=0;i<[keys count];i++){
             NSString *key=[keys objectAtIndex:i];
-            [req appendFormat:@"AND %@=\"%@\" ",key,[dict objectForKey:key]]; 
+            NSObject *value = [dict objectForKey:key];
+            
+            //Permet d'echapper les simples quote lors de l'insertion.
+            if ([value isKindOfClass:[NSString class]]) {
+                value = [(NSString*)value stringByReplacingOccurrencesOfString:@"'" withString:@"''"];
+            }
+            [req appendFormat:@"AND %@='%@' ",key,value]; 
         }
         return ([self exec:req]);
     }
     return NO;
 }
 
-
 -(void) logerr{
     int   code=sqlite3_errcode(sgbd);
     NSString *msgErr=[NSString stringWithUTF8String:sqlite3_errmsg( sgbd )];
     
-    NSLog(@"-YSBGD::Error [%d] => %@",code,msgErr);
+    NSLog(@"[SGBD][Error] [%d] => %@",code,msgErr);
     
 }
 
-
 -(BOOL) exec:(NSString*)req{
     if (!sgbd_opened)return NO;
-
-        
+    
+    
     sqlite3_stmt    *stmt;
     const char *query = [req UTF8String];
     BOOL ok=NO;
@@ -211,22 +290,21 @@ static YSGBD *sharedCurrent=NULL;
         if (stmt!=NULL)ok= (sqlite3_step(stmt) == SQLITE_DONE);
     
     if (!ok){
-        NSLog(@"Error REQ[%@]",req);
+        NSLog(@"[SGBD][Error] REQ[%@]",req);
         [self logerr];  
     }
     sqlite3_finalize(stmt);    
     return ok;
 }
 
-
--(NSArray*) execAndGet:(NSString*)req{
-    if (!sgbd_opened)return NO;
-
+-(NSMutableArray*) execAndGet:(NSString*)req{
+    if (!sgbd_opened)return nil;
+    
     sqlite3_stmt    *stmt=NULL;
     const char *query = [req UTF8String];
-
+    
     NSMutableArray *out=[[NSMutableArray alloc] init];
-    //NSLog(@"BEGIN YSBD::execAndGet(%@)",req);
+    //NSLog(@"[SGBD][Error] execAndGet(%@)",req);
     if (sqlite3_prepare_v2(sgbd, query, strlen(query), &stmt, NULL) == SQLITE_OK){
         while (stmt!=NULL && (sqlite3_step(stmt) == SQLITE_ROW)){
             
@@ -273,13 +351,11 @@ static YSGBD *sharedCurrent=NULL;
                 }
             }
             [out addObject:dict]; 
-            [dict release];
         }            
         if (stmt!=NULL)sqlite3_finalize(stmt);
     }else{
         [self logerr];
     }
-    //NSLog(@"END YSBD::execAndGet(%@)",req);
     return out;
 }
 
@@ -288,5 +364,8 @@ static YSGBD *sharedCurrent=NULL;
     return [self exec:req];
 }
 
+- (long) lastRowID{
+    return sqlite3_last_insert_rowid(sgbd);
+}
 
 @end
